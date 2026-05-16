@@ -1,7 +1,7 @@
 """
 Simple Movie Recommendation System
 MovieLens Dataset - Item-Based Collaborative Filtering
-WITH PROPER TRAIN/TEST SPLIT
+WITH PROPER TRAIN/TEST SPLIT AND RECALL METRIC
 """
 
 import pandas as pd
@@ -91,7 +91,8 @@ class SimpleRecommender:
             results.append({
                 'title': movie['title'],
                 'genres': movie['genres'],
-                'predicted_rating': rating
+                'predicted_rating': rating,
+                'movieId': movie_id
             })
         
         return results
@@ -124,13 +125,13 @@ class SimpleRecommender:
 
 
 # ============================================
-# EVALUATION WITH PROPER TRAIN/TEST SPLIT
+# EVALUATION WITH RECALL METRIC
 # ============================================
 
-def evaluate_recommender(train_ratings, test_ratings, movies_df, num_samples=1000):
+def evaluate_recommender(train_ratings, test_ratings, movies_df, k=10, rating_threshold=4.0):
     """
     Train on train_ratings, evaluate on test_ratings
-    This is the CORRECT way to evaluate
+    Includes Recall@k and Precision@k metrics
     """
     print("\n" + "="*50)
     print("EVALUATING WITH TRAIN/TEST SPLIT")
@@ -140,94 +141,91 @@ def evaluate_recommender(train_ratings, test_ratings, movies_df, num_samples=100
     print(f"\nTraining on {len(train_ratings)} ratings...")
     recommender = SimpleRecommender(train_ratings, movies_df)
     
-    # Test on unseen test data
-    print(f"Testing on {len(test_ratings)} ratings...")
-    sample = test_ratings.sample(min(num_samples, len(test_ratings)))
-    
-    predictions = []
-    actuals = []
-    skipped = 0
-    
-    for _, row in sample.iterrows():
-        pred = recommender.predict(row['userId'], row['movieId'])
-        if pred is not None:
-            predictions.append(pred)
-            actuals.append(row['rating'])
-        else:
-            skipped += 1
-    
-    if predictions:
-        mae = np.mean(np.abs(np.array(predictions) - np.array(actuals)))
-        rmse = np.sqrt(np.mean((np.array(predictions) - np.array(actuals)) ** 2))
+    # Group test ratings by user
+    test_user_ratings = {}
+    for _, row in test_ratings.iterrows():
+        user_id = row['userId']
+        movie_id = row['movieId']
+        rating = row['rating']
         
-        print(f"\n📊 EVALUATION RESULTS:")
-        print(f"   Test samples tested: {len(predictions)}")
-        print(f"   Samples skipped (no prediction): {skipped}")
-        print(f"   MAE:  {mae:.4f}")
-        print(f"   RMSE: {rmse:.4f}")
-        
-        return mae, rmse, recommender
-    else:
-        print("No predictions could be made!")
-        return None, None, None
-
-
-def evaluate_with_cross_validation(ratings_df, movies_df, k=5):
-    """
-    Perform k-fold cross-validation
-    More robust evaluation than single train/test split
-    """
-    print("\n" + "="*50)
-    print(f"{k}-FOLD CROSS-VALIDATION")
-    print("="*50)
+        if user_id not in test_user_ratings:
+            test_user_ratings[user_id] = {}
+        test_user_ratings[user_id][movie_id] = rating
     
-    # Create folds
-    ratings_shuffled = ratings_df.sample(frac=1, random_state=42).reset_index(drop=True)
-    fold_size = len(ratings_shuffled) // k
+    # Evaluate recommendations
+    print(f"Testing on {len(test_user_ratings)} users...")
     
+    precision_scores = []
+    recall_scores = []
     mae_scores = []
     rmse_scores = []
     
-    for fold in range(k):
-        print(f"\n--- Fold {fold+1}/{k} ---")
-        
-        # Split into train and validation for this fold
-        start_idx = fold * fold_size
-        end_idx = (fold + 1) * fold_size if fold < k-1 else len(ratings_shuffled)
-        
-        val_fold = ratings_shuffled.iloc[start_idx:end_idx]
-        train_fold = pd.concat([ratings_shuffled.iloc[:start_idx], 
-                                ratings_shuffled.iloc[end_idx:]])
-        
-        # Train on training fold
-        recommender = SimpleRecommender(train_fold, movies_df)
-        
-        # Evaluate on validation fold
-        predictions = []
-        actuals = []
-        
-        for _, row in val_fold.iterrows():
-            pred = recommender.predict(row['userId'], row['movieId'])
-            if pred is not None:
-                predictions.append(pred)
-                actuals.append(row['rating'])
-        
-        if predictions:
-            mae = np.mean(np.abs(np.array(predictions) - np.array(actuals)))
-            rmse = np.sqrt(np.mean((np.array(predictions) - np.array(actuals)) ** 2))
-            
-            mae_scores.append(mae)
-            rmse_scores.append(rmse)
-            
-            print(f"   MAE: {mae:.4f}, RMSE: {rmse:.4f}")
+    users_evaluated = 0
     
-    # Average across folds
-    print(f"\n{'='*50}")
-    print(f"CROSS-VALIDATION RESULTS ({k}-fold):")
-    print(f"   Average MAE:  {np.mean(mae_scores):.4f} (±{np.std(mae_scores):.4f})")
-    print(f"   Average RMSE: {np.mean(rmse_scores):.4f} (±{np.std(rmse_scores):.4f})")
+    for user_id, test_items in test_user_ratings.items():
+        # Only evaluate users that are in training data
+        if user_id not in recommender.user_ratings:
+            continue
+        
+        # Get recommendations for this user
+        recommendations = recommender.recommend(user_id, n=k)
+        recommended_movie_ids = [rec['movieId'] for rec in recommendations]
+        
+        # Find relevant items from test data (ratings >= threshold)
+        relevant_items = [movie_id for movie_id, rating in test_items.items() 
+                         if rating >= rating_threshold]
+        
+        if not relevant_items:
+            continue
+        
+        # Calculate hits (recommended AND relevant)
+        hits = len(set(recommended_movie_ids) & set(relevant_items))
+        
+        # Precision@k = hits / k
+        precision = hits / k
+        
+        # Recall@k = hits / total relevant items
+        recall = hits / len(relevant_items)
+        
+        precision_scores.append(precision)
+        recall_scores.append(recall)
+        
+        # Also calculate MAE/RMSE for rating predictions
+        for movie_id, actual_rating in test_items.items():
+            pred_rating = recommender.predict(user_id, movie_id)
+            if pred_rating is not None:
+                mae_scores.append(abs(pred_rating - actual_rating))
+                rmse_scores.append((pred_rating - actual_rating) ** 2)
+        
+        users_evaluated += 1
+        
+        # Limit number of users for speed (remove this line if you want all users)
+        if users_evaluated >= 500:
+            break
     
-    return mae_scores, rmse_scores
+    # Calculate metrics
+    print(f"\n📊 EVALUATION RESULTS (k={k}, threshold={rating_threshold}):")
+    print(f"   Users evaluated: {users_evaluated}")
+    
+    if precision_scores:
+        avg_precision = np.mean(precision_scores)
+        avg_recall = np.mean(recall_scores)
+        print(f"   Precision@{k}: {avg_precision:.4f}")
+        print(f"   Recall@{k}:    {avg_recall:.4f}")
+        print(f"   F1-Score:      {2 * (avg_precision * avg_recall) / (avg_precision + avg_recall):.4f}")
+    
+    if mae_scores:
+        avg_mae = np.mean(mae_scores)
+        avg_rmse = np.sqrt(np.mean(rmse_scores))
+        print(f"   MAE:  {avg_mae:.4f}")
+        print(f"   RMSE: {avg_rmse:.4f}")
+    
+    return recommender, {
+        'precision': np.mean(precision_scores) if precision_scores else 0,
+        'recall': np.mean(recall_scores) if recall_scores else 0,
+        'mae': np.mean(mae_scores) if mae_scores else 0,
+        'rmse': np.sqrt(np.mean(rmse_scores)) if rmse_scores else 0
+    }
 
 
 # ============================================
@@ -281,9 +279,8 @@ def main():
         print("2. Predict rating for a movie")
         print("3. Find similar movies")
         print("4. Search for a movie")
-        print("5. Evaluate on test data (single split)")
-        print("6. Cross-validation evaluation (5-fold)")
-        print("7. Show user's rated movies")
+        print("5. Evaluate on test data (with Recall & Precision)")
+        print("6. Show user's rated movies")
         print("0. Exit")
         
         choice = input("\nYour choice: ")
@@ -367,14 +364,16 @@ def main():
                     print(f"  Genres: {row['genres']}")
         
         elif choice == '5':
-            # Evaluate on held-out test data
-            evaluate_recommender(train_ratings, test_ratings, movies)
+            # Evaluate on held-out test data with recall
+            k = input("Enter k for Recall@k (default 10): ")
+            k = int(k) if k.strip() else 10
+            
+            threshold = input("Enter rating threshold for relevance (default 4.0): ")
+            threshold = float(threshold) if threshold.strip() else 4.0
+            
+            evaluate_recommender(train_ratings, test_ratings, movies, k=k, rating_threshold=threshold)
         
         elif choice == '6':
-            # Perform cross-validation
-            evaluate_with_cross_validation(ratings, movies, k=5)
-        
-        elif choice == '7':
             user = int(input("Enter user ID: "))
             
             if user in recommender.user_ratings:
